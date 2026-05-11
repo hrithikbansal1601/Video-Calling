@@ -1,0 +1,17 @@
+# Executable
+udp_video
+
+# Object files
+*.o
+
+# Build folders
+build/
+
+# macOS files
+.DS_Store
+
+# VS Code
+.vscode/
+
+# JetBrains IDE
+.idea/
