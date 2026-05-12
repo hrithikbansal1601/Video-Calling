@@ -1,163 +1,337 @@
 # UDP Video Calling
 
-A real-time peer-to-peer video streaming application built in C++ using raw UDP sockets and OpenCV. Frames are captured, JPEG-compressed, fragmented into 1400-byte UDP packets, transmitted, reassembled on the receiver side, and displayed live — all with a multithreaded architecture and no external streaming libraries.
+A real-time peer-to-peer video streaming application built in **C++** using raw **UDP sockets**, **ASIO**, and **OpenCV**.
+Frames are captured from a webcam, JPEG-compressed, fragmented into fixed-size UDP packets, transmitted across the network, reassembled on the receiver side, decoded, and displayed live using a multithreaded architecture.
+
+This project was built without external streaming frameworks such as WebRTC, GStreamer, or FFmpeg in order to understand low-level networking, packet fragmentation, concurrency, and real-time multimedia transport from scratch.
 
 ---
 
-## Features
+# Features
 
-- **Custom 1406-byte frame protocol** over non-blocking UDP sockets
-- **Multithreaded design** — separate Send, Receive, and GUI threads
-- **JPEG video pipeline** — 320×240 @ quality 100, ~40 KB per frame, fewer than 30 chunks per frame
-- **Mutex-protected shared state** using `std::mutex` + `lock_guard`
-- **Lock-free shutdown** via `atomic<bool> Run` triggered by ESC key
-- **Cross-host communication** — tested across two machines on a local network
+* Real-time webcam streaming over UDP
+* Cross-platform support:
+
+  * Linux
+  * Windows
+* Standalone ASIO networking
+* OpenCV JPEG encoding/decoding pipeline
+* Multithreaded architecture:
+
+  * Sender thread
+  * Receiver thread
+  * GUI thread
+* Frame fragmentation and reassembly
+* Non-blocking socket handling
+* Thread-safe shared frame access using `std::mutex`
+* Lock-free shutdown using `atomic<bool>`
+* Receive buffer tuning to reduce packet drops
+* ~30 FPS sender-side frame pacing
 
 ---
 
-## System Architecture
+# System Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────┐
 │                        main()                           │
-│   socket() → bind() → launch threads → imshow loop     │
-│               ↕ shared fd, mutex-protected latest_frame │
+│    launch sender/receiver threads + GUI loop            │
+│               ↕ mutex-protected latest_frame            │
 ├──────────────────────┬──────────────────────────────────┤
-│    thread_send       │         thread_recv              │
-│  cap >> frame        │  recvfrom() packets              │
-│  resize 320×240      │  reassemble chunks               │
-│  JPEG encode         │  imdecode()                      │
-│  fragment 1400B      │  { lock } latest_frame = img     │
-│  sendto()            │                                  │
+│    VideoSender       │         VideoReceiver            │
+│  capture webcam      │  receive UDP packets             │
+│  resize frame        │  reassemble chunks               │
+│  JPEG encode         │  JPEG decode                     │
+│  fragment packets    │  update shared frame             │
+│  send_to()           │                                  │
 └──────────────────────┴──────────────────────────────────┘
-          ↕  UDP Network  10.196.41.73:5001
+                    ↕ UDP Network
 ```
 
 ---
 
-## Frame Packet Protocol
+# Frame Packet Protocol
 
-Each UDP packet is a fixed-size `Frame` struct (1406 bytes, packed with `#pragma pack(push,1)`):
-
-| Field    | Type       | Size   | Description                        |
-|----------|------------|--------|------------------------------------|
-| `ID`     | `uint16_t` | 2 B    | Chunk index (0-based); `0xFFFF` = timeout sentinel |
-| `size`   | `uint32_t` | 4 B    | Total JPEG frame size in bytes     |
-| `body`   | `uint8_t[]`| 1400 B | Payload bytes for this chunk       |
-
-**Fragmentation:**
-```
-chunks  = ceil(total_size / 1400)
-offset  = ID × 1400
-bytes   = min(1400, remaining)
-```
-
-**Reassembly:** `ID == 0` resets state and pre-allocates `full_buffer` to `size` bytes. `0xFFFF` (EAGAIN/EWOULDBLOCK) causes a 10 ms sleep and retry.
-
----
-
-## Threading Model
-
-| Thread | Responsibilities |
-|---|---|
-| **main** | Creates socket, binds to port 5000, launches workers, runs `cv::imshow` / `waitKey` loop (OpenCV GUI must stay on the main thread), joins on exit |
-| **thread_send** | Captures frames from camera, resizes, JPEG-encodes, fragments, and sends via `sendto()` |
-| **thread_recv** | Receives packets via `recvfrom()`, reassembles into a full JPEG, decodes with `cv::imdecode`, and writes to `latest_frame` under lock |
-
-**Synchronisation primitives:**
-- `std::mutex` + `lock_guard` — protects `latest_frame` between the receiver writer and the GUI reader
-- `atomic<bool> Run` — lock-free shutdown signal; set to `false` on ESC, causing both worker threads to exit cleanly
-
----
-
-## Socket Design
+Each UDP packet uses a packed `Frame` structure:
 
 ```cpp
-// UDP socket
-int fd = socket(AF_INET, SOCK_DGRAM, 0);
-
-// Non-blocking I/O
-fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-
-// Bind to port 5000 (receiver)
-bind(fd, &addr, sizeof(addr));
-
-// Send / Receive
-sendto(fd, &pkt, ...);
-recvfrom(fd, &pkt, ...);
+#pragma pack(push,1)
+struct Frame {
+    uint8_t body[1400];
+    uint32_t size;
+    uint16_t ID;
+};
+#pragma pack(pop)
 ```
 
-- **UDP** — low latency, connectionless. Frame loss is tolerable; delay is not.
-- **Non-blocking** — `EAGAIN`/`EWOULDBLOCK` returns immediately; receiver thread sleeps 10 ms and retries.
-- **One socket, two threads** — send and receive share the same `fd`. Distinct ports (5000 local, 5001 remote) prevent self-loopback.
+`#pragma pack(push,1)` is used to avoid compiler-inserted padding bytes and ensure consistent packet layout across Windows and Linux builds.
+
+Total packet size:
+
+```text
+1400 bytes -> payload
+4 bytes    -> frame size
+2 bytes    -> chunk ID
+----------------------
+1406 bytes total
+```
+
+| Field  | Type            | Description           |
+| ------ | --------------- | --------------------- |
+| `body` | `uint8_t[1400]` | Packet payload        |
+| `size` | `uint32_t`      | Total JPEG frame size |
+| `ID`   | `uint16_t`      | Chunk sequence index  |
 
 ---
 
-## Prerequisites
+# Fragmentation Logic
 
-- Linux (tested on Ubuntu)
-- `g++` with C++11 or later
-- [OpenCV](https://opencv.org/) (`libopencv-dev`)
-- A working webcam
+```text
+chunks = ceil(total_size / 1400)
+
+offset = ID × 1400
+
+bytes = min(1400, remaining_bytes)
+```
+
+Frames are JPEG-encoded and fragmented into multiple UDP packets before transmission.
 
 ---
 
-## Build
+# Reassembly Logic
+
+* `ID == 0` initializes a new frame buffer
+* Incoming chunks are copied into the correct offset
+* Once all bytes are received:
+
+  * `cv::imdecode()` reconstructs the image
+  * decoded frame is stored in shared memory
+  * GUI thread displays frame using `cv::imshow()`
+
+Additional safety checks are used to:
+
+* prevent out-of-bounds writes
+* reject invalid frame sizes
+* avoid corrupt frame reconstruction
+
+---
+
+# Threading Model
+
+| Thread          | Responsibility                                                  |
+| --------------- | --------------------------------------------------------------- |
+| `main`          | GUI loop and thread management                                  |
+| `VideoSender`   | Camera capture, JPEG encode, fragmentation, packet transmission |
+| `VideoReceiver` | UDP receive, reassembly, JPEG decode                            |
+
+---
+
+# Synchronisation
+
+### Shared Frame Protection
+
+```cpp
+std::mutex frame_mutex;
+```
+
+Protects shared frame access between:
+
+* receiver thread (writer)
+* GUI thread (reader)
+
+---
+
+### Lock-Free Shutdown
+
+```cpp
+atomic<bool> Run;
+```
+
+Pressing `ESC` sets:
+
+```cpp
+Run = false;
+```
+
+allowing all threads to terminate cleanly.
+
+---
+
+# Technologies Used
+
+* C++17
+* Standalone ASIO
+* OpenCV
+* UDP sockets
+* Multithreading (`std::thread`)
+* Mutexes
+* Atomics
+* JPEG encoding/decoding
+
+---
+
+# Concepts Demonstrated
+
+* UDP socket programming
+* Cross-platform networking
+* Non-blocking I/O
+* Real-time multimedia streaming
+* Packet fragmentation and reassembly
+* Concurrent programming
+* Thread synchronization
+* Lock-free signalling
+* OpenCV image pipelines
+* JPEG compression
+* Low-level systems programming
+
+---
+
+# Cross Platform Support
+
+Tested on:
+
+* Linux (Ubuntu)
+* Windows (MSYS2 + MinGW)
+
+The networking layer uses standalone ASIO for portable UDP socket handling across operating systems.
+
+---
+
+# Dependencies
+
+## Ubuntu / Linux
 
 ```bash
-g++ main.cpp -o udp_video \
+sudo apt update
+sudo apt install libopencv-dev
+sudo apt install libasio-dev
+```
+
+---
+
+## Windows (MSYS2 / MinGW)
+
+Install:
+
+* OpenCV
+* Standalone ASIO
+* MinGW-w64
+
+Example using MSYS2:
+
+```bash
+pacman -S mingw-w64-ucrt-x86_64-opencv
+pacman -S mingw-w64-ucrt-x86_64-asio
+```
+
+---
+
+# Build
+
+## Linux
+
+```bash
+g++ linux_main.cpp -o udp_video \
     $(pkg-config --cflags --libs opencv4) \
-    -lpthread -std=c++17
+    -pthread \
+    -std=c++17
 ```
 
 ---
 
-## Usage
+## Windows (MSYS2 / MinGW)
 
-1. **Edit the destination IP** in `thread_send()`:
-   ```cpp
-   inet_pton(AF_INET, "10.196.41.73", &dest_addr.sin_addr);
-   ```
-   Replace with the IP address of the remote machine.
-
-2. **Run on both machines** (each acts as sender and receiver simultaneously):
-   ```bash
-   ./udp_video
-   ```
-
-3. **Stop** by pressing **ESC** in the display window.
-
-> Ports used: `5000` (local bind) and `5001` (remote destination). Ensure these are open in any firewall.
-
----
-
-## Known Limitations & Future Work
-
-### Current Limitations
-- No packet loss handling — missing chunks produce corrupt frames
-- No sequence numbers — interleaved packets from different frames are silently dropped
-- Fixed destination IP — no dynamic peer discovery
-- Sender can flood the link with no rate control
-
-### Planned Improvements
-- **Frame IDs** — detect stale or out-of-order chunks
-- **RTP/RTCP** — adopt standard real-time transport protocol
-- **Sender-side 30 fps rate cap** — avoid link saturation
-- **CLI args** — configure IP, ports, and quality at runtime
-- **Lightweight ACK** — basic loss detection
-
----
-
-## Project Structure
-
-```
-.
-├── main.cpp          # Full source (send thread, recv thread, main GUI loop)
-└── README.md
+```bash
+g++ windows_main.cpp -o VideoCalling.exe \
+    -I/ucrt64/include/opencv4 \
+    -DASIO_STANDALONE \
+    -lopencv_core \
+    -lopencv_videoio \
+    -lopencv_highgui \
+    -lopencv_imgproc \
+    -lopencv_imgcodecs \
+    -lws2_32 \
+    -lmswsock
 ```
 
 ---
 
-## License
+# Usage
 
-This project is provided for educational purposes.
+## 1. Edit Destination IP
+
+Inside sender code:
+
+```cpp
+auto target_address = asio::ip::make_address("10.196.50.83");
+```
+
+Replace with the IP address of the remote machine.
+
+---
+
+## 2. Run on Both Machines
+
+```bash
+./udp_video
+```
+
+Each machine simultaneously acts as:
+
+* sender
+* receiver
+
+---
+
+## 3. Stop Application
+
+Press:
+
+```text
+ESC
+```
+
+inside the OpenCV display window.
+
+---
+
+# Known Limitations
+
+* No packet loss recovery
+* No sequencing between frames
+* Out-of-order packets may corrupt frames
+* Fixed destination IP
+* No congestion/rate control
+* No encryption/authentication
+
+---
+
+# Future Improvements
+
+* Frame sequence numbers
+* RTP/RTCP integration
+* Adaptive bitrate control
+* Dynamic peer discovery
+* Lightweight ACK/retransmission system
+* CLI-configurable ports and IPs
+
+---
+
+# Project Structure
+
+```text
+udp-video-calling/
+│
+├── linux_main.cpp
+├── windows_main.cpp
+├── README.md
+├── Makefile
+├── .gitignore
+├── LICENSE
+├── UDP_Video_Calling.key
+│
+└── assets/
+```
+
+---
+
